@@ -7,16 +7,19 @@ export default {
       });
     }
 
+    // MEMPERBAIKI CARA MENGAMBIL TARGET URL
     const workerURL = new URL(request.url);
+    const originLength = workerURL.origin.length + 1; // Mengambil panjang domain + '/'
+    let target = request.url.substring(originLength);
 
-    // Target URL berada setelah /
-    // contoh:
-    // https://worker.workers.dev/http://example.com/live/index.m3u8
-    const target = decodeURIComponent(workerURL.pathname.substring(1));
+    // Jika target ter-encode, lakukan decode
+    if (!target.startsWith("http://") && !target.startsWith("https://")) {
+      target = decodeURIComponent(target);
+    }
 
     if (!/^https?:\/\//i.test(target)) {
       return new Response(
-        "Usage:\nhttps://worker.workers.dev/http://host/path/file.m3u8",
+        "Usage:\nhttps://workers.dev",
         {
           status: 400,
           headers: corsHeaders(),
@@ -28,7 +31,6 @@ export default {
 
     // Header yang diteruskan
     const headers = new Headers();
-
     const forwardHeaders = [
       "Range",
       "Accept",
@@ -45,62 +47,50 @@ export default {
       if (v) headers.set(h, v);
     }
 
+    // MEMPERBAIKI UTK TARGET ALAMAT IP (Mencegah Cloudflare Error 1003)
+    if (!headers.has("User-Agent")) {
+      headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+    }
+
     const response = await fetch(targetURL.toString(), {
       method: request.method,
       headers,
       redirect: "follow",
     });
 
-    // ------------------------
-    // Playlist (.m3u8)
-    // ------------------------
+    // Tahap 2: Manipulasi Playlist M3U8
     if (
       targetURL.pathname.endsWith(".m3u8") ||
       (response.headers.get("content-type") || "").includes("mpegurl")
     ) {
       let playlist = await response.text();
-
       const base = targetURL.origin;
-
-      const directory =
-        targetURL.origin +
-        targetURL.pathname.substring(
-          0,
-          targetURL.pathname.lastIndexOf("/") + 1
-        );
+      const directory = targetURL.origin + targetURL.pathname.substring(0, targetURL.pathname.lastIndexOf("/") + 1);
 
       playlist = playlist
         .split("\n")
         .map((line) => {
           const value = line.trim();
-
           if (value === "") return value;
 
-          // komentar
+          // Komentar atau Atribut URI
           if (value.startsWith("#")) {
-            // Rewrite URI="xxx"
-            return value.replace(
-              /URI="([^"]+)"/g,
-              (_, uri) => {
-                let absolute;
-
-                if (/^https?:\/\//i.test(uri)) {
-                  absolute = uri;
-                } else if (uri.startsWith("/")) {
-                  absolute = base + uri;
-                } else {
-                  absolute = directory + uri;
-                }
-
-                return `URI="${workerURL.origin}/${encodeURIComponent(
-                  absolute
-                )}"`;
+            return value.replace(/URI="([^"]+)"/g, (_, uri) => {
+              let absolute;
+              if (/^https?:\/\//i.test(uri)) {
+                absolute = uri;
+              } else if (uri.startsWith("/")) {
+                absolute = base + uri;
+              } else {
+                absolute = directory + uri;
               }
-            );
+              // Menggunakan format polos (tanpa encodeURIComponent) agar tidak merusak segmen tertentu
+              return `URI="${workerURL.origin}/${absolute}"`;
+            });
           }
 
+          // Baris Link Segmen (.ts / .m3u8)
           let absolute;
-
           if (/^https?:\/\//i.test(value)) {
             absolute = value;
           } else if (value.startsWith("/")) {
@@ -109,17 +99,13 @@ export default {
             absolute = directory + value;
           }
 
-          return `${workerURL.origin}/${encodeURIComponent(absolute)}`;
+          // Menggunakan format polos tanpa encode agar struktur url segmen tetap bersih
+          return `${workerURL.origin}/${absolute}`;
         })
         .join("\n");
 
       const outHeaders = new Headers(response.headers);
-
-      outHeaders.set(
-        "Content-Type",
-        "application/vnd.apple.mpegurl"
-      );
-
+      outHeaders.set("Content-Type", "application/vnd.apple.mpegurl");
       addCors(outHeaders);
 
       return new Response(playlist, {
@@ -128,13 +114,8 @@ export default {
       });
     }
 
-    // ------------------------
-    // Semua file selain m3u8
-    // Streaming langsung
-    // ------------------------
-
+    // Tahap 3: Meneruskan file segmen video (.ts)
     const outHeaders = new Headers(response.headers);
-
     addCors(outHeaders);
 
     return new Response(response.body, {
